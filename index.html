@@ -318,7 +318,7 @@
           <li><a href="https://www.cuit.columbia.edu/sites/www.cuit.columbia.edu/files/content/iPhone%2015%20Pro.pdf" target="_blank" rel="noopener">iPhone 15 Pro specification sheet</a></li>
           <li>Equipment imagery: <a href="https://www.liva.be/en/products/fujifilm-x-x100vi-body-silver" target="_blank" rel="noopener">X100VI</a>, <a href="https://profoto.com.mx/products/camara-fujifilm-mirrorless-x-e5-cuerpo?utm_content=Facebook_UA&utm_source=facebook&variant=51011939991873" target="_blank" rel="noopener">X-E5</a>, <a href="https://www.liverpool.com.mx/tienda/pdp/camara-de-accion-insta360-x4-standard-bundle-8k/1175706565" target="_blank" rel="noopener">X4</a>, <a href="https://dronekopenonline.nl/drones/dji-neo-2-motion-fly-more-combo-incl-goggles-n3-rc-motion-n3/" target="_blank" rel="noopener">Neo 2</a>, <a href="https://www.iphoneincanada.ca/2023/09/12/iphone-15-pro-announced-with-new-action-button/" target="_blank" rel="noopener">iPhone 15 Pro</a></li>
         </ul>
-        <p class="tiny">Country rules are best-effort guidance. Nearby airfields, official geozone geometry and NOTAMs are not verified here; use the linked national map or aviation authority immediately before launch.</p>
+        <p class="tiny">Country rules are best-effort guidance. Nearby airfield proximity is checked against OpenStreetMap data; official geozone geometry and NOTAMs are not verified here; use the linked national map or aviation authority immediately before launch.</p>
       </div>
     </section>
 
@@ -341,7 +341,7 @@
       buttons.forEach(function(b){b.addEventListener('click',function(){setFlow(b.dataset.flow);});});
 
       var toggles=document.querySelectorAll('.toggle');
-      var geo=null,selectedCode='',airspaceVerified=false;
+      var geo=null,selectedCode='',airspaceVerified=false,nearest=null,lookupFailed=false;
       var easa='https://www.easa.europa.eu/en/light/topics/drones-national-aviation-authorities-resources';
       var rules={
         DE:{name:'Germany',alt:'120 m',vlos:'Required',reg:'Yes',ins:'Yes',notes:'Use the dipul map for geozones; night flight needs a green flashing light.',url:'https://maptool-dipul.dfs.de/',label:'Open official dipul map ↗'},
@@ -379,6 +379,38 @@
         var link=document.getElementById('official-link');link.href=r.url;link.textContent=r.label||('Open official '+r.name+' guidance ↗');
         document.getElementById('official-copy').textContent='This is best-effort guidance only and never legal clearance. It cannot verify official geozone geometry or NOTAMs. Check the linked official source immediately before launch.';
       }
+      function reverseGeocode(lat,lon){
+        var u='https://api.bigdatacloud.net/data/reverse-geocode-client?latitude='+lat+'&longitude='+lon+'&localityLanguage=en';
+        return fetch(u).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(j){
+          return {cc:String(j.countryCode||'').toUpperCase()||null,countryName:j.countryName||null};
+        }).catch(function(){return null;});
+      }
+      function haversine(a,b,c,d){
+        var R=6371,t=Math.PI/180;
+        var h=Math.pow(Math.sin((c-a)*t/2),2)+Math.cos(a*t)*Math.cos(c*t)*Math.pow(Math.sin((d-b)*t/2),2);
+        return 2*R*Math.asin(Math.sqrt(h));
+      }
+      function nearestAirfield(lat,lon){
+        var q='[out:json][timeout:25];(node["aeroway"~"^(aerodrome|heliport|helipad)$"](around:9000,'+lat+','+lon+');way["aeroway"~"^(aerodrome|heliport|helipad)$"](around:9000,'+lat+','+lon+'););out center tags;';
+        var ctl=new AbortController();var to=setTimeout(function(){ctl.abort();},30000);
+        return fetch('https://overpass-api.de/api/interpreter',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q),signal:ctl.signal}).then(function(r){clearTimeout(to);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(j){
+          var best=null;
+          (j.elements||[]).forEach(function(e){
+            var la=e.type==='node'?e.lat:(e.center&&e.center.lat);
+            var lo=e.type==='node'?e.lon:(e.center&&e.center.lon);
+            if(la==null||lo==null)return;
+            var d=haversine(lat,lon,la,lo);
+            var kind=(e.tags&&e.tags.aeroway)||'aerodrome';
+            var label=kind==='aerodrome'?'airfield':kind;
+            var nm=(e.tags&&e.tags.name)||('unnamed '+label);
+            if(!best||d<best.d)best={d:d,name:nm,kind:label};
+          });
+          return best;
+        }).catch(function(){clearTimeout(to);return 'error';});
+      }
+      function fmtDist(km){return km<1?Math.round(km*1000)+' m':km.toFixed(1)+' km';}
+      function persistPrereq(){try{var ps=document.querySelectorAll('.prereq');localStorage.setItem('fg_prereq_reg',ps[0].getAttribute('aria-pressed'));localStorage.setItem('fg_prereq_ins',ps[1].getAttribute('aria-pressed'));}catch(e){}}
+      function restorePrereq(){try{var ps=document.querySelectorAll('.prereq');if(localStorage.getItem('fg_prereq_reg')==='true')ps[0].setAttribute('aria-pressed','true');if(localStorage.getItem('fg_prereq_ins')==='true')ps[1].setAttribute('aria-pressed','true');}catch(e){}}
       function getToggleState(selector){return Array.prototype.every.call(document.querySelectorAll(selector),function(t){return t.getAttribute('aria-pressed')==='true';});}
       function evaluate(){
         var reasons=[],state='caution',word='CHECK',sub='Complete every layer before unpacking the drone.';
@@ -393,24 +425,55 @@
         }else if(!sit){
           state='no';word='NO-GO';sub='One or more situational checks is not confirmed.';
           document.querySelectorAll('.situational').forEach(function(t){if(t.getAttribute('aria-pressed')!=='true')reasons.push('Unconfirmed: '+t.textContent.trim());});
-        }else if(!countryKnown()||!airspaceVerified){
+        }else if(!geo){
           state='caution';word='CAUTION';sub='Could not verify airspace — check the official map.';
           reasons.push(countryKnown()?'The baseline rules for '+currentRule().name+' are shown, but nearby airfields, geozones and NOTAMs were not verified.':'This country is not in the built-in rules table. Apply the generic baseline and check the local aviation authority.');
+        }else if(lookupFailed||!airspaceVerified){
+          state='caution';word='CAUTION';sub='Could not verify airspace — check the official map.';
+          reasons.push('The live airfield lookup failed — nearby airfields, geozones and NOTAMs were not verified. Check the official map before launching.');
+        }else if(nearest&&nearest.d<1.5){
+          state='no';word='NO-GO';sub='Too close to an airfield — do not fly here.';
+          reasons.push('Within '+fmtDist(nearest.d)+' of '+nearest.name+' ('+nearest.kind+') — too close to fly.');
+        }else if(nearest&&nearest.d<5){
+          state='caution';word='CAUTION';sub='Near an airfield — check the official map.';
+          reasons.push(fmtDist(nearest.d)+' from '+nearest.name+' ('+nearest.kind+') — check the official geozone map before launching.');
+        }else if(!countryKnown()){
+          state='caution';word='CAUTION';sub='Could not verify airspace — check the official map.';
+          reasons.push('This country is not in the built-in rules table. Apply the generic baseline and check the local aviation authority.');
         }else{
-          state='go';word='GO — PRELIMINARY';sub='No objections found. Verify on the official '+currentRule().name+' map before flying.';reasons.push('All checklist layers passed; official map confirmation is still required.');
+          state='go';word='GO — PRELIMINARY';sub='No objections found. Verify on the official '+currentRule().name+' map before flying.';
+          reasons.push('All checklist layers passed; official map confirmation is still required.');
+          reasons.push(nearest?('No airfields within 9 km in OpenStreetMap data (nearest: '+nearest.name+', '+fmtDist(nearest.d)+').'):'No airfields within 9 km in OpenStreetMap data.');
         }
         var v=document.getElementById('verdict');v.className='verdict '+state;document.getElementById('verdict-word').textContent=word;document.getElementById('verdict-sub').textContent=sub;
         var ul=document.getElementById('reasons');ul.innerHTML='';reasons.forEach(function(r){var li=document.createElement('li');li.textContent=r;ul.appendChild(li);});
       }
-      toggles.forEach(function(t){t.addEventListener('click',function(){t.setAttribute('aria-pressed',String(t.getAttribute('aria-pressed')!=='true'));evaluate();});});
+      toggles.forEach(function(t){t.addEventListener('click',function(){t.setAttribute('aria-pressed',String(t.getAttribute('aria-pressed')!=='true'));if(t.classList.contains('prereq'))persistPrereq();evaluate();});});
       var fallbackPanel=document.getElementById('country-fallback'),countrySelect=document.getElementById('country-select');
-      countrySelect.addEventListener('change',function(){selectedCode=countrySelect.value;geo=null;airspaceVerified=false;updateCountryUI();evaluate();});
+      countrySelect.addEventListener('change',function(){selectedCode=countrySelect.value;geo=null;airspaceVerified=false;nearest=null;lookupFailed=false;updateCountryUI();evaluate();});
       var locate=document.getElementById('locate-btn');
       locate.addEventListener('click',function(){
         if(!navigator.geolocation){document.getElementById('coords').textContent='Location is not available in this browser';fallbackPanel.classList.add('show');evaluate();return;}
         locate.disabled=true;locate.textContent='Getting position…';document.getElementById('coords').textContent='Waiting for GPS permission';
-        navigator.geolocation.getCurrentPosition(function(pos){geo={lat:pos.coords.latitude,lon:pos.coords.longitude,acc:pos.coords.accuracy};document.getElementById('coords').textContent=geo.lat.toFixed(5)+', '+geo.lon.toFixed(5)+' · ±'+Math.round(geo.acc)+'m';fallbackPanel.classList.add('show');locate.disabled=false;locate.textContent='Check again';airspaceVerified=false;evaluate();},function(err){geo=null;document.getElementById('coords').textContent=err.code===1?'Location permission was not granted':'Could not get a reliable position';fallbackPanel.classList.add('show');locate.disabled=false;locate.textContent='Try location again';evaluate();},{enableHighAccuracy:true,timeout:10000,maximumAge:60000});
+        navigator.geolocation.getCurrentPosition(function(pos){
+          geo={lat:pos.coords.latitude,lon:pos.coords.longitude,acc:pos.coords.accuracy};
+          nearest=null;lookupFailed=false;airspaceVerified=false;
+          document.getElementById('coords').textContent=geo.lat.toFixed(5)+', '+geo.lon.toFixed(5)+' · ±'+Math.round(geo.acc)+'m';
+          fallbackPanel.classList.add('show');
+          locate.textContent='Detecting country…';
+          reverseGeocode(geo.lat,geo.lon).then(function(rc){
+            if(rc&&rc.cc&&rules[rc.cc]){selectedCode=rc.cc;countrySelect.value=rc.cc;updateCountryUI();}
+            document.getElementById('coords').textContent=geo.lat.toFixed(5)+', '+geo.lon.toFixed(5)+' · ±'+Math.round(geo.acc)+'m'+(selectedCode&&rules[selectedCode]?' · '+rules[selectedCode].name+' ('+selectedCode+')':'');
+            locate.textContent='Checking airspace…';
+            return nearestAirfield(geo.lat,geo.lon);
+          }).then(function(nf){
+            if(nf==='error'){lookupFailed=true;airspaceVerified=false;nearest=null;}
+            else{lookupFailed=false;airspaceVerified=true;nearest=nf;}
+            locate.disabled=false;locate.textContent='Check again';evaluate();
+          }).catch(function(){lookupFailed=true;airspaceVerified=false;nearest=null;locate.disabled=false;locate.textContent='Check again';evaluate();});
+        },function(err){geo=null;nearest=null;airspaceVerified=false;lookupFailed=false;document.getElementById('coords').textContent=err.code===1?'Location permission was not granted':'Could not get a reliable position';fallbackPanel.classList.add('show');locate.disabled=false;locate.textContent='Try location again';evaluate();},{enableHighAccuracy:true,timeout:15000,maximumAge:60000});
       });
+      restorePrereq();
       updateCountryUI();
       evaluate();
     })();
